@@ -1,33 +1,47 @@
 #!/bin/bash
 # =====================================
-# Script quản lý VPS GCP (menu chọn tự động tránh trùng tên + quản lý port)
+# Script quản lý VPS GCP thông minh (by dockaka)
 # =====================================
 
-PROJECT_ID="quick-flame-377615"
+# ----- Chọn project -----
+echo "👉 Danh sách project bạn có:"
+gcloud projects list --format="table(projectNumber, projectId, name)"
+
+read -rp "Nhập PROJECT_ID hoặc PROJECT_NUMBER muốn dùng: " PROJECT_INPUT
+if [[ -z "$PROJECT_INPUT" ]]; then
+  echo "❌ Bạn chưa nhập PROJECT_ID hoặc PROJECT_NUMBER!"
+  exit 1
+fi
+
+# Nếu nhập là số (PROJECT_NUMBER) -> đổi sang PROJECT_ID
+if [[ "$PROJECT_INPUT" =~ ^[0-9]+$ ]]; then
+  PROJECT_ID=$(gcloud projects describe "$PROJECT_INPUT" --format="value(projectId)")
+else
+  PROJECT_ID="$PROJECT_INPUT"
+fi
+
+gcloud config set project "$PROJECT_ID" >/dev/null
+echo "✅ Đang làm việc trên project: $PROJECT_ID"
+
+# ----- Biến cấu hình -----
 ZONE="asia-southeast1-a"
 VM_NAME_BASE="vps-ubuntu-sing"
 DISK_SIZE="100GB"
 DISK_TYPE="pd-ssd"
 FIREWALL_NAME="allow-web-app"
 
-# Set project
-gcloud config set project "$PROJECT_ID" >/dev/null
-echo "👉 Đang làm việc trên project: $PROJECT_ID"
-
 # ----- Helpers -----
 resolve_instance_from_input() {
   local input="$1"
-  # Tìm theo tên
   local by_name
   by_name=$(gcloud compute instances list --project="$PROJECT_ID" \
               --filter="name=($input)" --format="value(name)" | head -n1)
-  if [[ -n "$by_name" ]]; then echo "$by_name"; return; fi
-  # Tìm theo IP
+  [[ -n "$by_name" ]] && { echo "$by_name"; return; }
   local by_ip
   by_ip=$(gcloud compute instances list --project="$PROJECT_ID" \
              --filter="EXTERNAL_IP:$input OR INTERNAL_IP:$input" \
              --format="value(name)" | head -n1)
-  if [[ -n "$by_ip" ]]; then echo "$by_ip"; return; fi
+  [[ -n "$by_ip" ]] && { echo "$by_ip"; return; }
   echo ""
 }
 
@@ -44,6 +58,13 @@ vm_status() {
   local zone="$2"
   gcloud compute instances describe "$name" --zone="$zone" --project="$PROJECT_ID" \
     --format='get(status)' 2>/dev/null
+}
+
+get_external_ip() {
+  local name="$1"
+  local zone="$2"
+  gcloud compute instances describe "$name" --zone="$zone" --project="$PROJECT_ID" \
+    --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
 }
 
 setup_firewall() {
@@ -81,18 +102,17 @@ create_vm() {
     --tags="$FIREWALL_NAME"
 
   echo "✅ VPS đã tạo xong. SSH vào bằng:"
-  echo "gcloud compute ssh $NAME --zone=$ZONE"
+  echo "gcloud compute ssh $NAME --zone=$ZONE --project=$PROJECT_ID"
 }
 
 check_ports_vm() {
   read -rp "Nhập TÊN hoặc IP VM để kiểm tra port: " token
   target=$(resolve_instance_from_input "$token")
   [[ -z "$target" ]] && { echo "❌ Không tìm thấy VM."; return; }
+  zone=$(get_zone_for_instance "$target")
 
   echo "👉 Kiểm tra firewall rules áp dụng cho VM $target..."
-  # Lấy network tags của VM
-  tags=$(gcloud compute instances describe "$target" --project="$PROJECT_ID" \
-           --zone="$(get_zone_for_instance "$target")" \
+  tags=$(gcloud compute instances describe "$target" --zone="$zone" --project="$PROJECT_ID" \
            --format="get(tags.items)")
   if [[ -z "$tags" ]]; then
     echo "❌ VM không có network tags nào."
@@ -103,7 +123,7 @@ check_ports_vm() {
     echo "🔎 Firewall rule cho tag: $tag"
     gcloud compute firewall-rules list --project="$PROJECT_ID" \
       --filter="targetTags:($tag)" \
-      --format="table(name,direction,action,priority,allowed[].map().firewall_rule().list())"
+      --format="table(name,direction,action,allowed[].map().firewall_rule().list())"
   done
 }
 
@@ -127,9 +147,9 @@ echo "==============================="
 echo "1) Tạo VPS (2 vCPU / 8GB RAM / 100GB SSD)"
 echo "2) Tạo VPS (4 vCPU / 16GB RAM / 100GB SSD)"
 echo "3) Xoá VM theo TÊN hoặc IP"
-echo "4) Dừng / Chạy lại VM theo TÊN hoặc IP"
+echo "4) Dừng / Chạy lại VM theo TÊN hoặc IP (in IP mới)"
 echo "5) Liệt kê danh sách VM trong project"
-echo "6) SSH vào VPS mặc định ($VM_NAME_BASE)"
+echo "6) SSH vào VM theo TÊN hoặc IP"
 echo "7) Kiểm tra port đã mở của 1 VM"
 echo "8) Thêm port thủ công vào firewall"
 echo "==============================="
@@ -143,7 +163,6 @@ case "$choice" in
     target=$(resolve_instance_from_input "$token")
     [[ -z "$target" ]] && { echo "❌ Không tìm thấy VM."; exit 1; }
     zone=$(get_zone_for_instance "$target")
-    echo "⚠️ Xoá VM $target (zone: $zone)..."
     gcloud compute instances delete "$target" --zone="$zone" --quiet
     ;;
   4)
@@ -153,25 +172,26 @@ case "$choice" in
     zone=$(get_zone_for_instance "$target")
     status=$(vm_status "$target" "$zone")
     if [[ "$status" == "RUNNING" ]]; then
-      gcloud compute instances stop "$target" --zone="$zone"
+      echo "👉 VM $target đang chạy. Đang dừng lại..."
+      gcloud compute instances stop "$target" --zone="$zone" --project="$PROJECT_ID"
+      echo "✅ VM $target đã dừng."
     elif [[ "$status" == "TERMINATED" ]]; then
-      gcloud compute instances start "$target" --zone="$zone"
+      echo "👉 VM $target đang tắt. Khởi động lại..."
+      gcloud compute instances start "$target" --zone="$zone" --project="$PROJECT_ID"
+      new_ip=$(get_external_ip "$target" "$zone")
+      echo "✅ VM $target đã khởi động xong."
+      echo "🌐 IP mới: $new_ip"
     else
       echo "⚠️ VM $target trạng thái: $status"
     fi
     ;;
   5) gcloud compute instances list --project="$PROJECT_ID" ;;
   6)
-    if gcloud compute instances describe "$VM_NAME_BASE" --zone="$ZONE" --project="$PROJECT_ID" >/dev/null 2>&1; then
-      status=$(vm_status "$VM_NAME_BASE" "$ZONE")
-      if [[ "$status" == "RUNNING" ]]; then
-        gcloud compute ssh "$VM_NAME_BASE" --zone="$ZONE"
-      else
-        echo "⚠️ VM $VM_NAME_BASE không chạy (trạng thái: $status)"
-      fi
-    else
-      echo "❌ VM $VM_NAME_BASE không tồn tại!"
-    fi
+    read -rp "Nhập TÊN hoặc IP để SSH: " token
+    target=$(resolve_instance_from_input "$token")
+    [[ -z "$target" ]] && { echo "❌ Không tìm thấy VM."; exit 1; }
+    zone=$(get_zone_for_instance "$target")
+    gcloud compute ssh "$target" --zone="$zone" --project="$PROJECT_ID"
     ;;
   7) check_ports_vm ;;
   8) add_ports_firewall ;;
